@@ -21,27 +21,13 @@ Environment `production`, só a branch `main`:
 - Secret `DEPLOY_KNOWN_HOSTS`: host key Ed25519 do homeserver, lida pelo SSH já autenticado; impressão digital `SHA256:/K+v8I52ayN8Ua9GQrhEgqmR2gWu91GYqLwa9OR6ax0`.
 - Variables `DEPLOY_HOST` = `homeserver.tail19def0.ts.net` e `DEPLOY_USER` = `vitor`.
 
-## Tailscale (falta fazer, no painel)
+## Tailscale
 
-Enquanto isso não existir, o push na `main` testa e publica a imagem, mas pula o job de deploy.
+Configurado em 2026-10-22 pela API da Tailscale.
 
-1. **Trust credential** (Settings → Trust credentials → identidade federada OIDC):
-   - Issuer: `https://token.actions.githubusercontent.com`
-   - Subject: `repo:Sampaio-Vitor@110466124/voos@1429763094:environment:production`
-   - Scope: Auth Keys (write)
-   - Tag: `tag:notas-ci`. Ela já tem `tcp:22` no homeserver, que é tudo de que o deploy precisa, então a policy não muda. Se preferir uma tag só deste repositório, crie `tag:voos-ci` em `tagOwners` e um grant `tag:voos-ci → 100.118.83.39 tcp:22`.
-2. No GitHub, em Settings → Secrets and variables → Actions:
-   - Environment `production`: secrets `TS_OAUTH_CLIENT_ID` (Client ID) e `TS_AUDIENCE` (Audience) da credencial.
-   - **Repository** variable `TS_TAG` = a tag escolhida. Ela liga o job de deploy; precisa ser do repositório, porque o `if` do job é avaliado antes do environment.
-
-   ```sh
-   gh secret set TS_OAUTH_CLIENT_ID -R Sampaio-Vitor/voos --env production
-   gh secret set TS_AUDIENCE -R Sampaio-Vitor/voos --env production
-   gh variable set TS_TAG -R Sampaio-Vitor/voos --body tag:notas-ci
-   gh workflow run Deploy -R Sampaio-Vitor/voos
-   ```
-
-3. **Tião:** a policy precisa deixar `tag:alaxe` chegar na porta 8790 do homeserver. Conferir com `ssh alaxe 'curl -s https://homeserver.tail19def0.ts.net:8790/healthz'`; se não responder, somar a porta ao grant que já libera o Notas (`tcp:4329`) para o notebook.
+- Trust credential `voos github actions` (identidade federada OIDC, id `ToDkw5nMEc11CNTRL-k3FkNQ4yaQ11CNTRL`): issuer `https://token.actions.githubusercontent.com`, subject `repo:Sampaio-Vitor@110466124/voos@1429763094:environment:production`, escopo só `auth_keys`, tag `tag:notas-ci`.
+- No GitHub: secrets `TS_OAUTH_CLIENT_ID` (o id) e `TS_AUDIENCE` (`api.tailscale.com/<id>`) no environment `production`, e a variable **do repositório** `TS_TAG` = `tag:notas-ci`. A `TS_TAG` liga o job de deploy; precisa ser do repositório porque o `if` do job é avaliado antes do environment. Apagar a variável desliga o deploy sem mexer no resto.
+- Rede: a policy da tailnet hoje é um único grant `* → *`, então o runner e o Tião alcançam a porta 8790 sem regra própria. Se a policy for fechada, o deploy precisa de `tag:notas-ci → 100.118.83.39 tcp:22`, e o Tião, de `tag:alaxe → 100.118.83.39 tcp:8790`.
 
 Se a troca de token falhar com `403`, confira o subject: ele usa os IDs numéricos (`gh api repos/Sampaio-Vitor/voos/actions/oidc/customization/sub --jq .sub_claim_prefix`, mais `:environment:production`).
 
