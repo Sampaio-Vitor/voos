@@ -23,8 +23,9 @@ def test_so_ida_com_link_da_companhia(google):
     r = google.buscar("GRU", "REC", dia, None, Filtros(max_escalas=0), "preco", 5)
     assert r["moeda"] == "BRL" and r["voos"]
     link = google.link(r["voos"][0]["id"])
-    assert link["preco"] > 0
-    assert link["link"].startswith("https://") and "google.com" not in link["link"]
+    assert link["preco"] > 0 and link["link"].startswith("https://")
+    # Com o RPC de reserva liberado, o link é o da companhia; recusado, o do Google.
+    assert ("google.com" in link["link"]) == (link["onde"] == "google_flights")
 
 
 def test_ida_e_volta(google):

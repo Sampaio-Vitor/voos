@@ -1,30 +1,38 @@
-"""Google Flights pela swoop: busca, voltas de uma ida e link de compra na companhia.
+"""Google Flights: busca, voltas de uma ida e link de compra na companhia.
 
 O fluxo é o mesmo do site: só ida lista os voos; ida e volta lista as idas com o
 preço total "a partir de", e só depois de escolher a ida aparecem as voltas com o
-preço do par. O link de compra é o da própria companhia (as agências exigem um
-token anti-bot do navegador e ficam de fora).
+preço do par.
+
+A busca lê a própria página de resultados (o `tfs` da URL diz o que buscar) e usa
+o decodificador da swoop nos dados que vêm nela. O link da companhia sai do RPC
+de reserva; se o Google recusar o RPC, o link é a tela de reserva do Google
+Flights já com o voo escolhido, a um toque do site da companhia. As agências
+ficam de fora: só aparecem para um navegador de verdade.
 """
 
 from __future__ import annotations
 
 import html
+import json
 import re
 import secrets
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from mcp.server.mcpserver.exceptions import ToolError
 from primp import Client
-from swoop import SORT_CHEAPEST, SORT_DEPARTURE_TIME, SORT_DURATION, Passengers, TransportConfig
+from swoop import Passengers, TransportConfig
 from swoop import rpc as swoop_rpc
-from swoop._selection import _iter_raw_itineraries, fetch_trip_booking_options
-from swoop.decoder import Itinerary
-from swoop.exceptions import SwoopError, SwoopRateLimitError
+from swoop._selection import fetch_trip_booking_options
+from swoop.decoder import Itinerary, decode_result
+from swoop.exceptions import SwoopError
+
+from . import tfs
 
 Cabine = Literal["economica", "premium", "executiva", "primeira"]
 Ordem = Literal["preco", "partida", "duracao"]
@@ -35,7 +43,7 @@ CABINES: dict[str, str] = {
     "executiva": "business",
     "primeira": "first",
 }
-ORDENS = {"preco": SORT_CHEAPEST, "partida": SORT_DEPARTURE_TIME, "duracao": SORT_DURATION}
+SITE = "https://www.google.com/travel/flights"
 IATA = re.compile(r"^[A-Z]{3}$")
 COMPANHIA = re.compile(r"^[A-Z0-9]{2}$")
 REDIRECT = re.compile(r"url='([^']+)'", re.IGNORECASE)
@@ -88,10 +96,10 @@ class Voltas(TypedDict):
 
 class Link(TypedDict):
     id: str
+    onde: Literal["companhia", "google_flights"]
     companhia: str
     preco: int
     moeda: str | None
-    tarifa: str | None
     link: str
     aviso: str
 
@@ -112,16 +120,27 @@ class Filtros:
             adults=self.adultos, children=self.criancas, infants_on_lap=self.bebes_no_colo
         )
 
+    def tipos(self) -> list[int]:
+        return (
+            [tfs.ADULTO] * self.adultos
+            + [tfs.CRIANCA] * self.criancas
+            + [tfs.BEBE_NO_COLO] * self.bebes_no_colo
+        )
+
 
 @dataclass
 class Opcao:
     """Uma linha devolvida ao agente. `itinerarios` tem a ida e, no par, a volta."""
 
-    pernas: list[dict[str, Any]]
+    pernas: list[tfs.Perna]
     itinerarios: list[Itinerary]
     filtros: Filtros
     precisa_volta: bool = False
     criada: float = field(default_factory=lambda: time.monotonic())
+
+    @property
+    def ida_e_volta(self) -> bool:
+        return len(self.pernas) == 2
 
 
 class Catalogo:
@@ -153,10 +172,22 @@ class Catalogo:
 
 
 class Google:
-    def __init__(self, catalogo: Catalogo | None = None, pais: str = "BR", timeout_s: int = 30):
+    def __init__(
+        self,
+        catalogo: Catalogo | None = None,
+        pais: str = "BR",
+        timeout_s: int = 30,
+        pausa_rpc_s: float = 900,
+    ):
         self.catalogo = catalogo or Catalogo()
-        self.transporte = TransportConfig(timeout=timeout_s, retries=2, country=pais)
-        self._http = Client(impersonate="chrome_145", impersonate_os="macos", timeout=timeout_s)
+        self.pais = pais
+        self.pausa_rpc_s = pausa_rpc_s
+        self.transporte = TransportConfig(timeout=timeout_s, retries=0, country=pais)
+        self._http = Client(
+            impersonate="chrome_145", impersonate_os="macos", cookie_store=True, timeout=timeout_s
+        )
+        # Recusado o RPC de reserva, não insiste por um tempo: insistir prolonga o bloqueio.
+        self._rpc_volta_em = 0.0
 
     # Busca
 
@@ -173,13 +204,26 @@ class Google:
         origem, destino = _iata(origem, "origem"), _iata(destino, "destino")
         ida = _data(data, "data")
         _validar(filtros)
-        pernas = [_perna(origem, destino, ida.isoformat(), filtros, partida=True)]
+        f = filtros
+        pernas = [
+            tfs.Perna(
+                ida.isoformat(),
+                origem,
+                destino,
+                f.max_escalas,
+                list(f.companhias),
+                f.partida_apos,
+                f.partida_ate,
+            )
+        ]
         if data_volta:
             volta = _data(data_volta, "data_volta")
             if volta < ida:
                 raise ErroDeBusca("A data_volta é anterior à data de ida.")
-            pernas.append(_perna(destino, origem, volta.isoformat(), filtros, partida=False))
-        itinerarios = self._consultar(pernas, filtros, ordenar)
+            pernas.append(
+                tfs.Perna(volta.isoformat(), destino, origem, f.max_escalas, list(f.companhias))
+            )
+        itinerarios = self._pagina(pernas, filtros)
         voos = []
         for itin in _ordenar(itinerarios, ordenar)[:limite]:
             opcao = Opcao(pernas, [itin], filtros, precisa_volta=bool(data_volta))
@@ -205,9 +249,7 @@ class Google:
         if not opcao.precisa_volta:
             raise ErroDeBusca("Esse id não é de uma ida de ida e volta. Use link_de_compra(id).")
         ida = opcao.itinerarios[0]
-        pernas = [dict(opcao.pernas[0]), dict(opcao.pernas[1])]
-        pernas[0]["selected_legs"] = swoop_rpc._build_selected_legs(ida)
-        itinerarios = self._consultar(pernas, opcao.filtros, ordenar)
+        itinerarios = self._pagina(_escolher(opcao.pernas, [ida]), opcao.filtros)
         voos = []
         for itin in _ordenar(itinerarios, ordenar)[:limite]:
             par = Opcao(opcao.pernas, [ida, itin], opcao.filtros)
@@ -227,32 +269,56 @@ class Google:
         opcao = self.catalogo.pegar(ident)
         if opcao.precisa_volta:
             raise ErroDeBusca("Falta escolher a volta: use opcoes_de_volta(id) antes do link.")
+        base: Link = {
+            "id": ident,
+            "onde": "google_flights",
+            "companhia": ", ".join(_companhias(opcao.itinerarios)),
+            "preco": opcao.itinerarios[-1].price,
+            "moeda": _moeda(opcao.itinerarios),
+            "link": self._reserva_no_google(opcao),
+            "aviso": (
+                "abre o Google Flights já com esse voo; é só tocar em reservar com a "
+                "companhia. Preço do momento: a companhia confirma no checkout"
+            ),
+        }
+        oferta = self._oferta_direta(opcao)
+        if oferta is None:
+            return base
+        return base | {
+            "onde": "companhia",
+            "companhia": oferta.seller_name,
+            "preco": oferta.price,
+            "link": self._resolver(oferta.booking_url),
+            "aviso": "preço do momento; a companhia confirma o valor final no checkout",
+        }
+
+    def _oferta_direta(self, opcao: Opcao):
+        if time.monotonic() < self._rpc_volta_em:
+            return None
+        pernas = [swoop_rpc._normalize_rpc_leg(p.de, p.para, p.data) for p in opcao.pernas]
         try:
             ofertas = fetch_trip_booking_options(
-                opcao.pernas,
+                pernas,
                 opcao.itinerarios,
                 cabin=CABINES[opcao.filtros.cabine],
                 passengers=opcao.filtros.passageiros(),
                 transport=self.transporte,
             )
-        except SwoopError as erro:
-            raise _traduzir(erro) from erro
+        except SwoopError:
+            ofertas = []
         diretas = [o for o in ofertas if o.is_airline_direct and o.booking_url and o.price > 0]
         if not diretas:
-            raise ErroDeBusca(
-                "O Google não devolveu oferta direta da companhia para esse voo. "
-                "Pode ter esgotado: faça a busca de novo."
-            )
-        oferta = min(diretas, key=lambda o: o.price)
-        return {
-            "id": ident,
-            "companhia": oferta.seller_name,
-            "preco": oferta.price,
-            "moeda": _moeda(opcao.itinerarios),
-            "tarifa": oferta.brand_label or None,
-            "link": self._resolver(oferta.booking_url),
-            "aviso": "preço do momento; a companhia confirma o valor final no checkout",
-        }
+            # Recusa e "sem oferta" chegam iguais; nos dois casos o link do Google serve.
+            self._rpc_volta_em = time.monotonic() + self.pausa_rpc_s
+            return None
+        return min(diretas, key=lambda o: o.price)
+
+    def _reserva_no_google(self, opcao: Opcao) -> str:
+        pernas = _escolher(opcao.pernas, opcao.itinerarios)
+        codigo = tfs.montar(
+            pernas, opcao.filtros.tipos(), CABINES[opcao.filtros.cabine], opcao.ida_e_volta
+        )
+        return f"{SITE}/booking?tfs={codigo}&hl=pt-BR&curr=BRL"
 
     def _resolver(self, url: str) -> str:
         """O link do Google é uma página com meta refresh para a companhia; devolver o
@@ -267,33 +333,57 @@ class Google:
         destino = html.unescape(destino or "")
         return destino if destino.startswith("https://") else url
 
-    # Interno
+    # Página de resultados
 
-    def _consultar(self, pernas, filtros: Filtros, ordenar: Ordem) -> list[Itinerary]:
+    def _pagina(self, pernas: list[tfs.Perna], filtros: Filtros) -> list[Itinerary]:
+        codigo = tfs.montar(pernas, filtros.tipos(), CABINES[filtros.cabine], len(pernas) == 2)
+        parametros = {"tfs": codigo, "hl": "pt-BR", "curr": "BRL", "gl": self.pais}
         try:
-            bruto = swoop_rpc._search_from_legs(
-                pernas,
-                cabin=CABINES[filtros.cabine],
-                passengers=filtros.passageiros(),
-                sort=ORDENS[ordenar],
-                transport=self.transporte,
-                retain_raw=False,
+            resposta = self._http.get(f"{SITE}/search", params=parametros)
+        except Exception as erro:
+            raise ErroDeBusca("O Google Flights não respondeu. Tente de novo.") from erro
+        if resposta.status_code == 429:
+            raise ErroDeBusca("O Google limitou as consultas agora. Tente em alguns minutos.")
+        if resposta.status_code != 200:
+            raise ErroDeBusca(f"O Google Flights respondeu {resposta.status_code}.")
+        return itinerarios_da_pagina(resposta.text)
+
+
+def itinerarios_da_pagina(pagina: str) -> list[Itinerary]:
+    """Os resultados vêm num `AF_initDataCallback` (ds:1) com o mesmo formato do RPC."""
+    inicio = pagina.find("key: 'ds:1'")
+    if inicio < 0:
+        raise ErroDeBusca(
+            "O Google Flights não devolveu a lista de voos. Pode ser limite temporário: "
+            "tente em alguns minutos."
+        )
+    trecho = pagina[inicio : pagina.find("</script>", inicio)]
+    try:
+        dados = json.loads(trecho.split("data:", 1)[1].rsplit(", sideChannel", 1)[0])
+        resultado = decode_result(dados) if dados else None
+    except Exception as erro:
+        raise ErroDeBusca("A página do Google Flights mudou e não deu para ler os voos.") from erro
+    if resultado is None:
+        return []
+    return [i for i in (*resultado.best, *resultado.other) if i.price]
+
+
+def _escolher(pernas: list[tfs.Perna], itinerarios: list[Itinerary]) -> list[tfs.Perna]:
+    """As pernas com os voos já escolhidos, na ordem: a ida e, se houver, a volta."""
+    escolhidas = list(pernas)
+    for i, itin in enumerate(itinerarios):
+        trechos = [
+            tfs.Trecho(
+                s.departure_airport_code,
+                _dia(s.departure_date),
+                s.arrival_airport_code,
+                s.airline,
+                s.flight_number,
             )
-        except SwoopError as erro:
-            raise _traduzir(erro) from erro
-        return [i for i in _iter_raw_itineraries(bruto) if i.price]
-
-
-def _perna(origem: str, destino: str, dia: str, f: Filtros, partida: bool) -> dict[str, Any]:
-    return swoop_rpc._normalize_rpc_leg(
-        origem,
-        destino,
-        dia,
-        max_stops=f.max_escalas,
-        airlines=list(f.companhias) or None,
-        earliest_departure=f.partida_apos if partida else None,
-        latest_departure=f.partida_ate if partida else None,
-    )
+            for s in itin.segments
+        ]
+        escolhidas[i] = replace(escolhidas[i], escolhidos=trechos)
+    return escolhidas
 
 
 def _ordenar(itinerarios: list[Itinerary], ordenar: Ordem) -> list[Itinerary]:
@@ -326,8 +416,19 @@ def _voo(ident: str, itin: Itinerary, com_preco: bool = True) -> Voo:
     return voo
 
 
+def _companhias(itinerarios: list[Itinerary]) -> list[str]:
+    nomes: list[str] = []
+    for itin in itinerarios:
+        nomes += [n for n in itin.airline_names if n not in nomes]
+    return nomes
+
+
+def _dia(dia: tuple[int, int, int]) -> str:
+    return f"{dia[0]:04d}-{dia[1]:02d}-{dia[2]:02d}"
+
+
 def _quando(dia: tuple[int, int, int], hora: tuple[int, int]) -> str:
-    return f"{dia[0]:04d}-{dia[1]:02d}-{dia[2]:02d}T{hora[0]:02d}:{hora[1]:02d}"
+    return f"{_dia(dia)}T{hora[0]:02d}:{hora[1]:02d}"
 
 
 def _moeda(itinerarios: list[Itinerary]) -> str | None:
@@ -368,9 +469,3 @@ def _validar(f: Filtros) -> None:
     for codigo in f.companhias:
         if not COMPANHIA.match(codigo):
             raise ErroDeBusca("companhias são códigos IATA de 2 caracteres, como G3, AD ou LA.")
-
-
-def _traduzir(erro: SwoopError) -> ErroDeBusca:
-    if isinstance(erro, SwoopRateLimitError):
-        return ErroDeBusca("O Google limitou as consultas agora. Tente de novo em alguns minutos.")
-    return ErroDeBusca(f"O Google Flights não respondeu como esperado ({type(erro).__name__}).")

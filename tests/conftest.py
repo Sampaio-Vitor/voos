@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 import pytest
 from swoop.builders import ItinerarySummary
-from swoop.decoder import BookingOption, Itinerary, Layover, RawSearchResult, Segment
+from swoop.decoder import BookingOption, Itinerary, Layover, Segment
 
 from voos import google as modulo
 from voos.google import Catalogo, Google
@@ -54,24 +54,28 @@ def itinerario(
 class Resposta:
     text: str = ""
     headers: dict = field(default_factory=dict)
+    status_code: int = 200
 
 
 @dataclass
 class GoogleFalso:
     """Faz o papel do Google: guarda as consultas e devolve o que o teste mandar."""
 
-    buscas: list[list[dict]] = field(default_factory=list)
+    buscas: list = field(default_factory=list)
     resultados: list[list[Itinerary]] = field(default_factory=list)
-    reservas: list[tuple[list[dict], list[Itinerary]]] = field(default_factory=list)
+    reservas: list = field(default_factory=list)
     ofertas: list[BookingOption] = field(default_factory=list)
+    recusar_reserva: bool = False
     pagina: str = ""
 
-    def buscar(self, pernas, **_):
+    def buscar(self, pernas, filtros):
         self.buscas.append(pernas)
-        return RawSearchResult(best=self.resultados.pop(0))
+        return self.resultados.pop(0)
 
     def reservar(self, pernas, itinerarios, **_):
         self.reservas.append((pernas, itinerarios))
+        if self.recusar_reserva:
+            return []
         return self.ofertas
 
     def get(self, url):
@@ -81,7 +85,6 @@ class GoogleFalso:
 @pytest.fixture
 def falso(monkeypatch):
     g = GoogleFalso()
-    monkeypatch.setattr(modulo.swoop_rpc, "_search_from_legs", g.buscar)
     monkeypatch.setattr(modulo, "fetch_trip_booking_options", g.reservar)
     return g
 
@@ -90,4 +93,5 @@ def falso(monkeypatch):
 def google(falso):
     servico = Google(Catalogo())
     servico._http = falso
+    servico._pagina = falso.buscar
     return servico

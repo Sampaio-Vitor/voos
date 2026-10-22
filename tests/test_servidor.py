@@ -48,7 +48,7 @@ def test_busca_e_link_pelo_mcp(cliente, falso):
     assert not r["isError"]
     voo = r["structuredContent"]["voos"][0]
     assert voo["voos"] == ["G3 1560"] and voo["preco"] == 1670
-    assert falso.buscas[0][0]["airlines"] == ["G3"]
+    assert falso.buscas[0][0].companhias == ["G3"]
 
     link = ferramenta(cliente, "link_de_compra", id=voo["id"])["structuredContent"]
     assert (link["companhia"], link["preco"]) == ("Gol", 1825)

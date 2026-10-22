@@ -2,6 +2,7 @@ import pytest
 from swoop.decoder import BookingOption
 
 from voos.google import Catalogo, ErroDeBusca, Filtros, Opcao
+from voos.tfs import Trecho
 
 from .conftest import itinerario
 
@@ -22,6 +23,11 @@ def oferta(vendedor, preco, direta=True, url="https://www.google.com/travel/clk/
     )
 
 
+def buscar_um(google, falso, itin, volta=None):
+    falso.resultados.append([itin])
+    return google.buscar("GRU", "REC", DIA, volta, Filtros(), "preco", 5)["voos"][0]["id"]
+
+
 def test_so_ida_ordena_por_preco_e_descreve_o_voo(google, falso):
     falso.resultados = [[GOL, AZUL, LATAM]]
     r = google.buscar("gru", "REC", DIA, None, Filtros(max_escalas=1), "preco", 2)
@@ -32,51 +38,53 @@ def test_so_ida_ordena_por_preco_e_descreve_o_voo(google, falso):
     assert latam["escalas"] == 1 and latam["conexoes"] == [{"aeroporto": "GRU", "espera_min": 60}]
     assert latam["partida"] == "2030-11-20T10:00"
     (perna,) = falso.buscas[0]
-    assert (perna["origin"], perna["destination"], perna["max_stops"]) == ("GRU", "REC", 1)
+    assert (perna.de, perna.para, perna.max_escalas) == ("GRU", "REC", 1)
 
 
 def test_filtro_de_horario_vale_so_para_a_ida(google, falso):
     falso.resultados = [[AZUL]]
     google.buscar("GRU", "REC", DIA, VOLTA, Filtros(partida_apos=6, partida_ate=12), "preco", 5)
     ida, volta = falso.buscas[0]
-    assert (ida["earliest_departure"], ida["latest_departure"]) == (6, 12)
-    assert (volta["origin"], volta["destination"], volta["date"]) == ("REC", "GRU", VOLTA)
-    assert volta["earliest_departure"] is None
+    assert (ida.partida_apos, ida.partida_ate) == (6, 12)
+    assert (volta.de, volta.para, volta.data) == ("REC", "GRU", VOLTA)
+    assert volta.partida_apos is None
 
 
-def test_link_da_so_ida_resolve_para_o_site_da_companhia(google, falso):
-    falso.resultados = [[GOL]]
+def test_link_da_companhia_quando_o_google_deixa(google, falso):
     falso.ofertas = [oferta("123milhas", 1500, direta=False), oferta("Gol", 1825)]
     falso.pagina = PAGINA_GOL
-    ident = google.buscar("GRU", "REC", DIA, None, Filtros(), "preco", 5)["voos"][0]["id"]
-    link = google.link(ident)
-    assert link["companhia"] == "Gol" and link["preco"] == 1825
+    link = google.link(buscar_um(google, falso, GOL))
+    assert (link["onde"], link["companhia"], link["preco"]) == ("companhia", "Gol", 1825)
     assert link["link"] == "https://b2c.voegol.com.br/compra?de=GRU&para=REC&vooSelecionado1=G31560"
     pernas, itinerarios = falso.reservas[0]
-    assert itinerarios == [GOL] and pernas == falso.buscas[0]
+    assert itinerarios == [GOL] and pernas[0]["origin"] == "GRU"
 
 
-def test_link_fica_no_google_se_a_pagina_mudar(google, falso):
-    falso.resultados = [[GOL]]
+def test_link_da_companhia_fica_no_google_se_a_pagina_mudar(google, falso):
     falso.ofertas = [oferta("Gol", 1825)]
     falso.pagina = "<html>outra coisa</html>"
-    ident = google.buscar("GRU", "REC", DIA, None, Filtros(), "preco", 5)["voos"][0]["id"]
-    assert google.link(ident)["link"].startswith("https://www.google.com/travel/clk/")
+    assert google.link(buscar_um(google, falso, GOL))["link"].startswith(
+        "https://www.google.com/travel/clk/"
+    )
 
 
-def test_sem_oferta_direta_explica(google, falso):
-    falso.resultados = [[GOL]]
-    falso.ofertas = [oferta("maxmilhas", 1556, direta=False)]
-    ident = google.buscar("GRU", "REC", DIA, None, Filtros(), "preco", 5)["voos"][0]["id"]
-    with pytest.raises(ErroDeBusca, match="oferta direta"):
-        google.link(ident)
+def test_recusa_vira_tela_de_reserva_do_google_e_pausa_o_rpc(google, falso):
+    falso.recusar_reserva = True
+    link = google.link(buscar_um(google, falso, GOL))
+    assert (link["onde"], link["companhia"], link["preco"]) == ("google_flights", "Gol", 1670)
+    assert link["link"].startswith("https://www.google.com/travel/flights/booking?tfs=")
+    assert "&curr=BRL" in link["link"]
+
+    falso.recusar_reserva = False
+    falso.ofertas = [oferta("Gol", 1825)]
+    assert google.link(buscar_um(google, falso, GOL))["onde"] == "google_flights"
+    assert len(falso.reservas) == 1  # pausado: nem tentou de novo
 
 
 def test_ida_e_volta_em_duas_etapas(google, falso):
     volta = itinerario([("AD", "4820", "REC", "GRU")], 1477, dia=(2030, 11, 27))
     falso.resultados = [[AZUL], [volta]]
-    falso.ofertas = [oferta("Azul", 1477)]
-    falso.pagina = "<meta content=\"0;url='https://www.voeazul.com.br/selecao'\">"
+    falso.recusar_reserva = True
     r = google.buscar("GRU", "REC", DIA, VOLTA, Filtros(), "preco", 5)
     id_ida = r["voos"][0]["id"]
     assert r["tipo"] == "ida_e_volta" and "opcoes_de_volta" in r["proximo_passo"]
@@ -86,21 +94,19 @@ def test_ida_e_volta_em_duas_etapas(google, falso):
 
     v = google.voltas(id_ida, "preco", 5)
     assert v["ida"]["voos"] == ["AD 2959"] and "preco" not in v["ida"]
-    ida_marcada, _ = falso.buscas[1]
-    assert ida_marcada["selected_legs"] == [["GRU", DIA, "REC", None, "AD", "2959"]]
-    assert "selected_legs" not in falso.buscas[0][0] or falso.buscas[0][0]["selected_legs"] is None
+    ida_marcada, volta_livre = falso.buscas[1]
+    assert ida_marcada.escolhidos == [Trecho("GRU", DIA, "REC", "AD", "2959")]
+    assert volta_livre.escolhidos == [] and falso.buscas[0][0].escolhidos == []
 
     link = google.link(v["voos"][0]["id"])
-    assert link["link"] == "https://www.voeazul.com.br/selecao"
+    assert (link["preco"], link["companhia"]) == (1477, "Azul")
     _, itinerarios = falso.reservas[0]
     assert itinerarios == [AZUL, volta]
 
 
 def test_voltas_recusa_id_de_so_ida(google, falso):
-    falso.resultados = [[GOL]]
-    ident = google.buscar("GRU", "REC", DIA, None, Filtros(), "preco", 5)["voos"][0]["id"]
     with pytest.raises(ErroDeBusca, match="link_de_compra"):
-        google.voltas(ident, "preco", 5)
+        google.voltas(buscar_um(google, falso, GOL), "preco", 5)
 
 
 @pytest.mark.parametrize(
