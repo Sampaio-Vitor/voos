@@ -1,0 +1,23 @@
+services:
+  voos:
+    image: ${VOOS_IMAGE:-voos:local}
+    build: .
+    restart: unless-stopped
+    # Só o loopback: a tailnet chega pelo `tailscale serve` (docs/deploy.md).
+    ports:
+      - "127.0.0.1:${VOOS_PORTA:-8790}:8790"
+    environment:
+      # Host aceitos além do loopback: o nome por onde o tailscale serve entrega.
+      VOOS_HOSTS: ${VOOS_HOSTS:-homeserver.tail19def0.ts.net,homeserver.tail19def0.ts.net:8790}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

@@ -1,0 +1,37 @@
+[project]
+name = "voos"
+version = "0.1.0"
+description = "MCP de preços de voos do Google Flights, com link de compra na companhia"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mcp>=2.3,<3",
+    # Usa funções internas da swoop (ida e volta em duas etapas): versão fixa,
+    # e os testes ao vivo avisam se o Google ou a biblioteca mudarem.
+    "swoop-flights==0.7.0",
+    "uvicorn>=0.38",
+]
+
+[project.scripts]
+voos = "voos.servidor:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["ao_vivo: consulta o Google Flights de verdade (rode com -m ao_vivo)"]
+addopts = "-m 'not ao_vivo'"
