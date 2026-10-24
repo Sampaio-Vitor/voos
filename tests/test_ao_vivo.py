@@ -43,3 +43,12 @@ def test_ida_e_volta(google):
     assert voltas["voos"]
     link = google.link(voltas["voos"][0]["id"])
     assert link["preco"] > 0 and link["link"].startswith("https://")
+
+
+def test_precos_por_data(google):
+    ida = date.today() + timedelta(days=45)
+    r = google.precos_por_data(
+        "GRU", "REC", ida.isoformat(), (ida + timedelta(days=7)).isoformat(), Filtros(), 1
+    )
+    assert r["moeda"] == "BRL" and len(r["ida"]) == len(r["volta"]) == 3
+    assert any(d["preco"] for d in r["ida"])

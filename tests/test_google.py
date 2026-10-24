@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 import pytest
 from swoop.decoder import BookingOption
 
@@ -138,3 +140,57 @@ def test_catalogo_vence_e_tem_limite(monkeypatch):
     agora[0] += 61
     with pytest.raises(ErroDeBusca):
         catalogo.pegar(c)
+
+
+def pagina_por_data(precos, erro_em=()):
+    """Faz o papel do `_pagina` em buscas paralelas: o preço depende das datas pedidas."""
+    pedidos = []
+
+    def pagina(pernas, filtros):
+        datas = tuple(p.data for p in pernas)
+        pedidos.append(datas)
+        if datas in erro_em:
+            raise ErroDeBusca("O Google limitou as consultas agora. Tente em alguns minutos.")
+        preco = precos.get(datas)
+        return [] if preco is None else [itinerario([("AD", "1", "CNF", "REC")], preco)]
+
+    return pagina, pedidos
+
+
+def test_precos_por_data_muda_uma_data_de_cada_vez(google):
+    precos = {("2030-11-20", "2030-11-25"): 2643, ("2030-11-21", "2030-11-25"): 2291}
+    google._pagina, pedidos = pagina_por_data(precos)
+    r = google.precos_por_data("CNF", "REC", "2030-11-20", "2030-11-25", Filtros(), 3)
+    assert r["tipo"] == "ida_e_volta" and r["moeda"] == "BRL"
+    assert [d["data"] for d in r["ida"]][0] == "2030-11-17"
+    assert [d["data"] for d in r["volta"]][-1] == "2030-11-28"
+    assert {d["data"]: d["preco"] for d in r["ida"]}["2030-11-21"] == 2291
+    assert {d["data"]: d["preco"] for d in r["volta"]}["2030-11-25"] == 2643
+    # O par pedido aparece nas duas filas e é buscado uma vez; volta antes da ida, nenhuma.
+    assert len(pedidos) == len(set(pedidos)) == 13
+    assert all(volta >= ida for ida, volta in pedidos)
+
+
+def test_precos_por_data_nao_busca_o_que_ja_passou(google):
+    amanha = date.today() + timedelta(days=1)
+    google._pagina, pedidos = pagina_por_data({(amanha.isoformat(),): 900})
+    r = google.precos_por_data("CNF", "REC", amanha.isoformat(), None, Filtros(), 2)
+    assert r["tipo"] == "so_ida" and r["volta"] is None
+    assert [d["preco"] for d in r["ida"]][:3] == [None, None, 900]
+    # Ontem nem vai ao Google; hoje vai, porque ainda pode ter voo mais tarde.
+    ontem = (amanha - timedelta(days=2)).isoformat()
+    assert len(pedidos) == 4 and (ontem,) not in pedidos
+
+
+def test_precos_por_data_com_falha_parcial_e_total(google):
+    limitado = ("2030-11-19",)
+    google._pagina, _ = pagina_por_data({("2030-11-20",): 900}, erro_em={limitado})
+    r = google.precos_por_data("CNF", "REC", "2030-11-20", None, Filtros(), 1)
+    assert [d["preco"] for d in r["ida"]] == [None, 900, None]
+
+    tudo = {(f"2030-11-{d}",) for d in (19, 20, 21)}
+    google._pagina, _ = pagina_por_data({}, erro_em=tudo)
+    with pytest.raises(ErroDeBusca, match="limitou"):
+        google.precos_por_data("CNF", "REC", "2030-11-20", None, Filtros(), 1)
+    with pytest.raises(ErroDeBusca, match="dias vai de 1 a 3"):
+        google.precos_por_data("CNF", "REC", "2030-11-20", None, Filtros(), 5)

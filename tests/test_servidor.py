@@ -30,9 +30,30 @@ def test_healthz(cliente):
     assert cliente.get("/healthz").json() == {"ok": True, "revisao": "abc123"}
 
 
-def test_lista_as_tres_ferramentas(cliente):
+def test_lista_as_ferramentas(cliente):
     nomes = {t["name"] for t in chamar(cliente, "tools/list")["tools"]}
-    assert nomes == {"buscar_voos", "opcoes_de_volta", "link_de_compra"}
+    assert nomes == {"buscar_voos", "opcoes_de_volta", "link_de_compra", "precos_por_data"}
+
+
+def test_precos_por_data_pelo_mcp(cliente, google):
+    pedidos = []
+
+    def pagina(pernas, filtros):
+        pedidos.append((pernas[0].data, filtros.adultos, pernas[0].max_escalas))
+        return [itinerario([("AD", "1", "CNF", "REC")], 1000 + int(pernas[0].data[-2:]))]
+
+    google._pagina = pagina
+    r = ferramenta(
+        cliente, "precos_por_data", origem="CNF", destino="REC", data="2030-11-20",
+        adultos=2, max_escalas=0, dias=1,
+    )  # fmt: skip
+    assert not r["isError"]
+    assert r["structuredContent"]["ida"] == [
+        {"data": "2030-11-19", "preco": 1019},
+        {"data": "2030-11-20", "preco": 1020},
+        {"data": "2030-11-21", "preco": 1021},
+    ]
+    assert {(a, e) for _, a, e in pedidos} == {(2, 0)}
 
 
 def test_busca_e_link_pelo_mcp(cliente, falso):

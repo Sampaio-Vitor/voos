@@ -20,8 +20,9 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal, NotRequired, TypedDict
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -47,6 +48,9 @@ SITE = "https://www.google.com/travel/flights"
 IATA = re.compile(r"^[A-Z]{3}$")
 COMPANHIA = re.compile(r"^[A-Z0-9]{2}$")
 REDIRECT = re.compile(r"url='([^']+)'", re.IGNORECASE)
+Par = tuple[date, date | None]  # datas de ida e de volta
+DIAS_MAX = 3  # dias antes e depois de cada data em precos_por_data
+PARALELAS = 3  # buscas ao mesmo tempo em precos_por_data; 12 levam uns 4 s
 
 
 class ErroDeBusca(ToolError):
@@ -92,6 +96,19 @@ class Voltas(TypedDict):
     proximo_passo: str
     ida: Voo
     voos: list[Voo]
+
+
+class PrecoDoDia(TypedDict):
+    data: str
+    preco: int | None
+
+
+class PrecosPorData(TypedDict):
+    tipo: Literal["so_ida", "ida_e_volta"]
+    moeda: str | None
+    preco_quer_dizer: str
+    ida: list[PrecoDoDia]
+    volta: list[PrecoDoDia] | None
 
 
 class Link(TypedDict):
@@ -202,27 +219,9 @@ class Google:
         limite: int,
     ) -> Busca:
         origem, destino = _iata(origem, "origem"), _iata(destino, "destino")
-        ida = _data(data, "data")
+        ida, volta = _datas(data, data_volta)
         _validar(filtros)
-        f = filtros
-        pernas = [
-            tfs.Perna(
-                ida.isoformat(),
-                origem,
-                destino,
-                f.max_escalas,
-                list(f.companhias),
-                f.partida_apos,
-                f.partida_ate,
-            )
-        ]
-        if data_volta:
-            volta = _data(data_volta, "data_volta")
-            if volta < ida:
-                raise ErroDeBusca("A data_volta é anterior à data de ida.")
-            pernas.append(
-                tfs.Perna(volta.isoformat(), destino, origem, f.max_escalas, list(f.companhias))
-            )
+        pernas = _pernas(origem, destino, ida, volta, filtros)
         itinerarios = self._pagina(pernas, filtros)
         voos = []
         for itin in _ordenar(itinerarios, ordenar)[:limite]:
@@ -242,6 +241,75 @@ class Google:
                 else "link_de_compra(id) com o voo escolhido"
             ),
             "voos": voos,
+        }
+
+    def precos_por_data(
+        self,
+        origem: str,
+        destino: str,
+        data: str,
+        data_volta: str | None,
+        filtros: Filtros,
+        dias: int = DIAS_MAX,
+    ) -> PrecosPorData:
+        """O menor preço de cada dia perto das datas, para escolher quando viajar.
+
+        Uma busca da página por dia, `PARALELAS` de cada vez. Na ida e volta, a fila da
+        ida muda só a data da ida (a volta fica) e a da volta muda só a data da volta; o
+        par pedido é buscado uma vez só. Dia que já passou, ou que poria a volta antes da
+        ida, fica sem preço e nem vai ao Google. Não guarda ids: escolhida a data, o
+        agente busca de novo com buscar_voos.
+        """
+        origem, destino = _iata(origem, "origem"), _iata(destino, "destino")
+        ida, volta = _datas(data, data_volta)
+        _validar(filtros)
+        if not 1 <= dias <= DIAS_MAX:
+            raise ErroDeBusca(f"dias vai de 1 a {DIAS_MAX}.")
+        # Cada fila tem o dia que aparece e o par buscado para ele.
+        perto = [timedelta(days=n) for n in range(-dias, dias + 1)]
+        filas = {"ida": [(ida + d, (ida + d, volta)) for d in perto]}
+        if volta:
+            filas["volta"] = [(volta + d, (ida, volta + d)) for d in perto]
+        hoje = date.today()
+        pares = list(
+            dict.fromkeys(
+                par
+                for fila in filas.values()
+                for _, par in fila
+                if par[0] >= hoje and (par[1] is None or par[1] >= par[0])
+            )
+        )
+
+        def menor(par: Par) -> tuple[int | None, str | None, ErroDeBusca | None]:
+            try:
+                itinerarios = self._pagina(_pernas(origem, destino, *par, filtros), filtros)
+            except ErroDeBusca as erro:
+                return None, None, erro
+            precos = [i.price for i in itinerarios if i.price]
+            return (min(precos) if precos else None), _moeda(itinerarios), None
+
+        with ThreadPoolExecutor(PARALELAS) as ex:
+            achados = dict(zip(pares, ex.map(menor, pares), strict=True))
+        erros = [e for _, _, e in achados.values() if e]
+        if erros and len(erros) == len(achados):
+            raise erros[0]
+
+        def fila(nome: str) -> list[PrecoDoDia]:
+            return [
+                {"data": dia.isoformat(), "preco": achados[par][0] if par in achados else None}
+                for dia, par in filas[nome]
+            ]
+
+        return {
+            "tipo": "ida_e_volta" if volta else "so_ida",
+            "moeda": next((m for _, m, _ in achados.values() if m), None),
+            "preco_quer_dizer": (
+                "menor total da ida e volta de cada dia; a outra data fica como pedida"
+                if volta
+                else "menor preço da ida de cada dia"
+            ),
+            "ida": fila("ida"),
+            "volta": fila("volta") if volta else None,
         }
 
     def voltas(self, id_ida: str, ordenar: Ordem, limite: int) -> Voltas:
@@ -440,6 +508,36 @@ def _iata(valor: str, campo: str) -> str:
     if not IATA.match(codigo):
         raise ErroDeBusca(f"{campo} precisa ser um código IATA de 3 letras, como GRU ou CNF.")
     return codigo
+
+
+def _datas(data: str, data_volta: str | None) -> tuple[date, date | None]:
+    ida = _data(data, "data")
+    volta = _data(data_volta, "data_volta") if data_volta else None
+    if volta and volta < ida:
+        raise ErroDeBusca("A data_volta é anterior à data de ida.")
+    return ida, volta
+
+
+def _pernas(
+    origem: str, destino: str, ida: date, volta: date | None, f: Filtros
+) -> list[tfs.Perna]:
+    """A ida, com o filtro de horário, e a volta, sem ele."""
+    pernas = [
+        tfs.Perna(
+            ida.isoformat(),
+            origem,
+            destino,
+            f.max_escalas,
+            list(f.companhias),
+            f.partida_apos,
+            f.partida_ate,
+        )
+    ]
+    if volta:
+        pernas.append(
+            tfs.Perna(volta.isoformat(), destino, origem, f.max_escalas, list(f.companhias))
+        )
+    return pernas
 
 
 def _data(valor: str, campo: str) -> date:

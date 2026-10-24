@@ -17,7 +17,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .google import Busca, Cabine, Filtros, Google, Link, Ordem, Voltas
+from .google import DIAS_MAX, Busca, Cabine, Filtros, Google, Link, Ordem, PrecosPorData, Voltas
 
 LOCAL = ("127.0.0.1:*", "localhost:*")
 INSTRUCOES = """\
@@ -27,6 +27,8 @@ Só ida: buscar_voos → link_de_compra(id).
 Ida e volta: buscar_voos com data_volta → opcoes_de_volta(id da ida) → link_de_compra(id da volta).
 Na ida e volta, o preço da ida é o total do par "a partir de";
 o preço final é o da volta escolhida.
+Para escolher a data: precos_por_data dá o menor preço de cada dia perto das datas pedidas
+(sem ids; escolhida a data, use buscar_voos).
 Aeroportos e companhias em códigos IATA (GRU, CGH, CNF, REC; G3 = Gol, AD = Azul, LA = LATAM).
 Os ids valem por uma hora. Preço é do momento: a companhia confirma no checkout.
 """
@@ -35,6 +37,40 @@ Iata = Annotated[str, Field(description="Código IATA do aeroporto, 3 letras (ex
 Data = Annotated[str, Field(description="Data no formato AAAA-MM-DD")]
 Limite = Annotated[int, Field(ge=1, le=30, description="Quantos voos devolver")]
 OrdemCampo = Annotated[Ordem, Field(description="preco, partida ou duracao")]
+DataVolta = Annotated[str | None, Field(description="AAAA-MM-DD para ida e volta; vazio é só ida")]
+Adultos = Annotated[int, Field(ge=1, le=9)]
+Criancas = Annotated[int, Field(ge=0, le=8, description="De 2 a 11 anos")]
+Bebes = Annotated[int, Field(ge=0, le=4, description="Menores de 2")]
+MaxEscalas = Annotated[
+    int | None, Field(ge=0, le=2, description="0 = só voos diretos; vazio = qualquer")
+]
+Companhias = Annotated[
+    list[str] | None, Field(description="Só estas companhias, em IATA (ex.: ['G3', 'AD'])")
+]
+PartidaApos = Annotated[int | None, Field(ge=0, le=23, description="Hora mínima de partida da ida")]
+PartidaAte = Annotated[int | None, Field(ge=0, le=23, description="Hora máxima de partida da ida")]
+
+
+def _filtros(
+    adultos: int,
+    criancas: int,
+    bebes_no_colo: int,
+    cabine: Cabine,
+    max_escalas: int | None,
+    companhias: list[str] | None,
+    partida_apos: int | None,
+    partida_ate: int | None,
+) -> Filtros:
+    return Filtros(
+        adultos=adultos,
+        criancas=criancas,
+        bebes_no_colo=bebes_no_colo,
+        cabine=cabine,
+        max_escalas=max_escalas,
+        companhias=tuple(c.strip().upper() for c in companhias or ()),
+        partida_apos=partida_apos,
+        partida_ate=partida_ate,
+    )
 
 
 def criar(google: Google | None = None, hosts: tuple[str, ...] = LOCAL, revisao: str = "dev"):
@@ -46,42 +82,57 @@ def criar(google: Google | None = None, hosts: tuple[str, ...] = LOCAL, revisao:
         origem: Iata,
         destino: Iata,
         data: Data,
-        data_volta: Annotated[
-            str | None, Field(description="AAAA-MM-DD para ida e volta; vazio é só ida")
-        ] = None,
-        adultos: Annotated[int, Field(ge=1, le=9)] = 1,
-        criancas: Annotated[int, Field(ge=0, le=8, description="De 2 a 11 anos")] = 0,
-        bebes_no_colo: Annotated[int, Field(ge=0, le=4, description="Menores de 2")] = 0,
+        data_volta: DataVolta = None,
+        adultos: Adultos = 1,
+        criancas: Criancas = 0,
+        bebes_no_colo: Bebes = 0,
         cabine: Cabine = "economica",
-        max_escalas: Annotated[
-            int | None, Field(ge=0, le=2, description="0 = só voos diretos; vazio = qualquer")
-        ] = None,
-        companhias: Annotated[
-            list[str] | None,
-            Field(description="Só estas companhias, em IATA (ex.: ['G3', 'AD'])"),
-        ] = None,
-        partida_apos: Annotated[
-            int | None, Field(ge=0, le=23, description="Hora mínima de partida da ida")
-        ] = None,
-        partida_ate: Annotated[
-            int | None, Field(ge=0, le=23, description="Hora máxima de partida da ida")
-        ] = None,
+        max_escalas: MaxEscalas = None,
+        companhias: Companhias = None,
+        partida_apos: PartidaApos = None,
+        partida_ate: PartidaAte = None,
         ordenar: OrdemCampo = "preco",
         limite: Limite = 8,
     ) -> Busca:
         """Busca voos com preço. Cada voo tem um id para link_de_compra ou opcoes_de_volta."""
-        filtros = Filtros(
-            adultos=adultos,
-            criancas=criancas,
-            bebes_no_colo=bebes_no_colo,
-            cabine=cabine,
-            max_escalas=max_escalas,
-            companhias=tuple(c.strip().upper() for c in companhias or ()),
-            partida_apos=partida_apos,
-            partida_ate=partida_ate,
-        )
+        filtros = _filtros(
+            adultos, criancas, bebes_no_colo, cabine, max_escalas, companhias,
+            partida_apos, partida_ate,
+        )  # fmt: skip
         return await anyio.to_thread.run_sync(
             google.buscar, origem, destino, data, data_volta, filtros, ordenar, limite
+        )
+
+    @mcp.tool()
+    async def precos_por_data(
+        origem: Iata,
+        destino: Iata,
+        data: Data,
+        data_volta: DataVolta = None,
+        adultos: Adultos = 1,
+        criancas: Criancas = 0,
+        bebes_no_colo: Bebes = 0,
+        cabine: Cabine = "economica",
+        max_escalas: MaxEscalas = None,
+        companhias: Companhias = None,
+        partida_apos: PartidaApos = None,
+        partida_ate: PartidaAte = None,
+        dias: Annotated[
+            int, Field(ge=1, le=DIAS_MAX, description="Dias antes e depois de cada data")
+        ] = DIAS_MAX,
+    ) -> PrecosPorData:
+        """Menor preço de cada dia perto das datas, para escolher quando viajar.
+
+        Na ida e volta, `ida` muda só a data da ida (a volta fica como pedida) e `volta`
+        muda só a da volta. Dia sem voo, que já passou ou que inverteria as datas vem
+        com preco nulo. Não devolve ids: escolhida a data, use buscar_voos.
+        """
+        filtros = _filtros(
+            adultos, criancas, bebes_no_colo, cabine, max_escalas, companhias,
+            partida_apos, partida_ate,
+        )  # fmt: skip
+        return await anyio.to_thread.run_sync(
+            google.precos_por_data, origem, destino, data, data_volta, filtros, dias
         )
 
     @mcp.tool()

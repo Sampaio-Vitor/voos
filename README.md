@@ -11,9 +11,13 @@ Não usa API paga nem chave. A busca lê a própria página de resultados do Goo
 | `buscar_voos` | Voos com preço. Origem e destino em IATA (`CNF`, `GRU`), data `AAAA-MM-DD`, e opcionais: `data_volta`, passageiros, cabine, `max_escalas`, `companhias`, faixa de horário da ida, ordem e limite. Cada voo vem com um `id`. |
 | `opcoes_de_volta` | Para ida e volta: as voltas da ida escolhida, cada uma com o preço total do par. |
 | `link_de_compra` | O link para comprar o voo (ou o par) escolhido, com o preço do momento. `onde` diz se é o site da companhia ou a tela de reserva do Google Flights. |
+| `precos_por_data` | O menor preço de cada dia perto das datas pedidas (até 3 dias antes e depois), para escolher quando viajar. Na ida e volta, a fila `ida` muda só a data da ida e a `volta` só a da volta. Não devolve ids. |
 
 Só ida: `buscar_voos` → `link_de_compra(id)`.
 Ida e volta: `buscar_voos(data_volta=...)` → `opcoes_de_volta(id da ida)` → `link_de_compra(id da volta)`. É o mesmo fluxo do site: o preço da ida e volta depende do par, e pode sair bem mais barato que duas idas avulsas.
+Escolher a data: `precos_por_data(...)` com os mesmos filtros → `buscar_voos` na data escolhida.
+
+O Google não deixa ler o calendário de preços (o RPC `GetCalendarGraph` responde erro 13) e a página de resultados não traz outras datas. Por isso `precos_por_data` faz uma busca da página por dia, três de cada vez: as 13 buscas de uma ida e volta com 3 dias para cada lado levam uns 4 a 5 s. Dia que já passou, ou que poria a volta antes da ida, nem vai ao Google.
 
 Exemplo de link devolvido:
 
@@ -26,6 +30,7 @@ Limites conhecidos:
 - Só a oferta direta da companhia. As agências (maxmilhas, 123milhas, Decolar) só aparecem para um navegador de verdade.
 - Se o Google recusar o endpoint de reserva (acontece depois de muitas consultas do mesmo IP), o link vira a tela de reserva do Google Flights já com o voo escolhido (`onde: google_flights`), a um toque do site da companhia. O serviço para de tentar o endpoint por 15 minutos e volta sozinho.
 - Os `id` ficam na memória por uma hora. Reiniciar o serviço obriga a buscar de novo.
+- Com mais de um passageiro, o preço é o total do grupo, como no site.
 - Preço é do momento; a companhia confirma no checkout.
 
 ## Rodar

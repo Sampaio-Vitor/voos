@@ -1,6 +1,6 @@
 # Ligar no Tião
 
-O serviço já está pronto para o Tião; falta só o lado do `alaxe`, que não foi mexido.
+O Tião usa o serviço pelo hub, no app Passagens (decisões 0066 e 0080 do `alaxe`): `buscar_voos`, `opcoes_de_volta` e `link_de_compra` para as buscas e os links, e `precos_por_data` para a escolha de datas na tela.
 
 - URL: `https://homeserver.tail19def0.ts.net:8790/mcp` (Streamable HTTP, sem sessão, respostas em JSON).
 - Sem token: só a tailnet alcança a porta, e o serviço só lê preços públicos.
@@ -16,6 +16,7 @@ allowed_tools = [
     "mcp__voos__buscar_voos",
     "mcp__voos__opcoes_de_volta",
     "mcp__voos__link_de_compra",
+    "mcp__voos__precos_por_data",
 ]
 ```
 
@@ -23,7 +24,7 @@ As instruções do servidor (enviadas no `initialize`) explicam ao modelo o flux
 
 ## Pelo hub (como o Notas)
 
-Igual ao `apps/compras/notas.py`: abrir a sessão, `initialize`, `call_tool` e ler `structured_content`. As três ferramentas devolvem JSON estruturado (com schema), então dá para desenhar os voos na tela sem passar pelo modelo. Sugestão para o `config.toml`:
+Igual ao `apps/compras/notas.py`: abrir a sessão, `initialize`, `call_tool` e ler `structured_content`. As ferramentas devolvem JSON estruturado (com schema), então dá para desenhar os voos na tela sem passar pelo modelo. Sugestão para o `config.toml`:
 
 ```toml
 [voos]
